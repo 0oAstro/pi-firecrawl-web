@@ -1,4 +1,3 @@
-import { Defuddle } from "defuddle/node";
 import type { Api, Model, ProviderHeaders, Usage } from "@earendil-works/pi-ai";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
@@ -13,6 +12,7 @@ export interface ExtractedContent {
   text: string;
   usage: Usage;
   model: string;
+  inputTruncated: boolean;
 }
 
 const MAX_EXTRACTION_INPUT_CHARS = 120_000;
@@ -27,6 +27,9 @@ function boundExtractionInput(markdown: string): string {
 
 export async function cleanFirecrawlHtml(html: string, url: string): Promise<string | undefined> {
   try {
+    // Keep the HTML parser out of Pi's startup path. Most sessions never use
+    // web_fetch, and defuddle pulls in linkedom and its full parser tree.
+    const { Defuddle } = await import("defuddle/node");
     const result = await Defuddle(html, url, {
       markdown: true,
       removeImages: true,
@@ -72,6 +75,7 @@ export async function extractFirecrawlContent(options: {
 }): Promise<ExtractedContent | undefined> {
   if (options.signal?.aborted) throw abortError(options.signal);
   const selected = await resolveExtractionModel(options.registry, options.model);
+  if (options.signal?.aborted) throw abortError(options.signal);
   if (!selected) return undefined;
 
   try {
@@ -112,9 +116,11 @@ export async function extractFirecrawlContent(options: {
       text,
       usage: response.usage,
       model: `${selected.model.provider}/${selected.model.id}`,
+      inputTruncated: options.markdown.length > MAX_EXTRACTION_INPUT_CHARS,
     };
-  } catch {
+  } catch (error) {
     if (options.signal?.aborted) throw abortError(options.signal);
+    if (error instanceof Error && error.name === "AbortError") throw error;
     return undefined;
   }
 }

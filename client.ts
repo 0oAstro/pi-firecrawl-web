@@ -37,6 +37,9 @@ export interface FirecrawlScrapeMetadata {
   contentType?: string;
   error?: string;
   scrapeId?: string;
+  cacheState?: string;
+  cachedAt?: string;
+  creditsUsed?: number;
   [key: string]: unknown;
 }
 
@@ -50,6 +53,7 @@ export interface FirecrawlScrapeResult {
   highlights?: string[];
   links?: string[];
   images?: string[];
+  branding?: Record<string, unknown>;
   metadata: FirecrawlScrapeMetadata;
   warning?: string;
 }
@@ -71,12 +75,14 @@ export interface SearchRequest {
   includeDomains?: string[];
   excludeDomains?: string[];
   tbs?: string;
+  scrapeOptions?: { formats: ["markdown"]; onlyMainContent: boolean; maxAge?: number };
 }
 
 export interface ScrapeRequest {
   url: string;
   formats: FirecrawlScrapeFormat[];
   onlyMainContent: boolean;
+  maxAge?: number;
 }
 
 export interface MapRequest {
@@ -131,7 +137,7 @@ function requireSuccess(payload: unknown, label: string): Record<string, unknown
   const record = requireRecord(payload, label);
   if (record.success !== true) {
     throw new FirecrawlApiError(
-      stringValue(record.error) ?? `Firecrawl ${label} failed.`,
+      `Firecrawl ${label} failed: ${stringValue(record.error) ?? "unsuccessful response"}.`,
       numberValue(record.statusCode) ?? 200,
       stringValue(record.code),
     );
@@ -153,12 +159,17 @@ function parseWebResults(value: unknown): FirecrawlWebResult[] {
   });
 }
 
+function responseWarning(...records: Record<string, unknown>[]): string | undefined {
+  const warnings = records.flatMap((record) => [stringValue(record.warning), ...(stringArray(record.warnings) ?? [])]);
+  return [...new Set(warnings.filter((value): value is string => Boolean(value)))].join("; ") || undefined;
+}
+
 function parseSearchResponse(payload: unknown): FirecrawlSearchResult {
   const response = requireSuccess(payload, "search");
   const data = requireRecord(response.data, "search data");
   return {
     web: parseWebResults(data.web),
-    warning: stringValue(response.warning),
+    warning: responseWarning(response, data),
     id: stringValue(response.id),
     creditsUsed: numberValue(response.creditsUsed),
   };
@@ -177,8 +188,9 @@ function parseScrapeResponse(payload: unknown): FirecrawlScrapeResult {
     highlights: stringArray(data.highlights),
     links: stringArray(data.links),
     images: stringArray(data.images),
+    branding: isRecord(data.branding) ? data.branding : undefined,
     metadata: isRecord(data.metadata) ? data.metadata : {},
-    warning: stringValue(data.warning),
+    warning: responseWarning(response, data),
   };
 }
 
@@ -209,22 +221,19 @@ export class FirecrawlClient {
   }
 
   async search(options: SearchRequest, signal?: AbortSignal): Promise<FirecrawlSearchResult> {
-    return parseSearchResponse(await this.post("search", options, signal));
+    return parseSearchResponse(await this.request("search", options, signal));
   }
 
   async scrape(options: ScrapeRequest, signal?: AbortSignal): Promise<FirecrawlScrapeResult> {
-    return parseScrapeResponse(await this.post("scrape", options, signal));
+    return parseScrapeResponse(await this.request("scrape", options, signal));
   }
 
   async map(options: MapRequest, signal?: AbortSignal): Promise<FirecrawlMapResult> {
-    return parseMapResponse(await this.post("map", options, signal));
-  }
-
-  private async post(endpoint: string, body: object, signal?: AbortSignal): Promise<unknown> {
-    return this.request(endpoint, body, signal);
+    return parseMapResponse(await this.request("map", options, signal));
   }
 
   private async request(endpoint: string, body: object, signal?: AbortSignal): Promise<unknown> {
+    signal?.throwIfAborted();
     let response: Response;
     try {
       response = await fetch(`${this.baseUrl}/${endpoint}`, {
@@ -242,21 +251,22 @@ export class FirecrawlClient {
     }
 
     if (!response.ok) {
-      const payload = await this.readJson(response);
+      const payload = await this.readJson(response, signal);
       throw new FirecrawlApiError(
-        isRecord(payload) ? stringValue(payload.error) ?? `Firecrawl request failed with HTTP ${response.status}.` : `Firecrawl request failed with HTTP ${response.status}.`,
+        `Firecrawl HTTP ${response.status}: ${isRecord(payload) ? stringValue(payload.error) ?? "request failed" : "request failed"}.`,
         response.status,
         isRecord(payload) ? stringValue(payload.code) : undefined,
       );
     }
-    return this.readJson(response);
+    return this.readJson(response, signal);
   }
 
-  private async readJson(response: Response): Promise<unknown> {
+  private async readJson(response: Response, signal?: AbortSignal): Promise<unknown> {
     try {
       return await response.json();
     } catch {
-      throw new FirecrawlApiError("Firecrawl returned a non-JSON response.", response.status);
+      signal?.throwIfAborted();
+      throw new FirecrawlApiError(`Firecrawl returned a non-JSON response (HTTP ${response.status}).`, response.status);
     }
   }
 }
