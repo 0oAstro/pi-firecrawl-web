@@ -19,8 +19,5 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
-  },
-  "scripts": {
-    "test": "bun tests/run.ts"
   }
 }
