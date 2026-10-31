@@ -178,16 +178,6 @@ A small informal test compared an earlier version of this extension with a hoste
 - Page content is untrusted. The focused-extraction prompt tells the model to ignore instructions embedded in the page, but that is a mitigation, not a guarantee.
 - Saved output files use private permissions, but they contain the page text you requested. If a page contains sensitive data, so does the file.
 
-## Validation
-
-Tests run through Pi's extension loader. There is no `npm test` script. Offline mode makes no API or model calls:
-
-```bash
-pi --offline -ne -ns -np -nc --no-session -p -e ./tests/run.ts /firecrawl-tests < /dev/null
-```
-
-Replace the prompt with `'/firecrawl-tests live'` to add three real checks: search with content, a long-page fetch, and focused extraction. The live checks spend Firecrawl and model credits. The current version passes 33 offline and 3 live checks. These are regression tests, not a comparison with other tools.
-
 ## License
 
 [MIT](LICENSE) © 2026 0oAstro
