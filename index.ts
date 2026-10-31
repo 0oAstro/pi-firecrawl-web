@@ -8,9 +8,12 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   FirecrawlClient,
+  type AlexandriaResponse,
   type FirecrawlScrapeFormat,
   type FirecrawlScrapeResult,
   type FirecrawlSearchResult,
+  type SearchCategory,
+  type SearchSource,
 } from "./client.js";
 import { cleanFirecrawlHtml, extractFirecrawlContent, type ExtractedContent } from "./content.js";
 
@@ -32,10 +35,10 @@ const SCRAPE_FORMATS = [
   "screenshot",
   "branding",
   "audio",
-  "highlights",
 ] as const satisfies readonly FirecrawlScrapeFormat[];
+const SEARCH_SOURCES = ["web", "news", "images", "alexandria"] as const satisfies readonly SearchSource[];
+const SEARCH_CATEGORIES = ["github", "research", "pdf", "developer", "gov"] as const satisfies readonly SearchCategory[];
 
-const DEFAULT_FETCH_MODEL = "openai-codex/gpt-5.3-codex-spark";
 const DEFAULT_SEARCH_MAX_CHARS = 8192;
 const DEFAULT_FETCH_MAX_CHARS = 20000;
 const DEFAULT_MAP_MAX_CHARS = 12000;
@@ -45,21 +48,22 @@ const SETTINGS_KEY = "firecrawl-web";
 
 function fetchModel(): string {
   const settingsPath = join(getAgentDir(), "settings.json");
+  const missing = `Set ${SETTINGS_KEY}.fetchModel in ${settingsPath} to a provider/model string.`;
   let settings: unknown;
   try {
     settings = JSON.parse(readFileSync(settingsPath, "utf8"));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return DEFAULT_FETCH_MODEL;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(missing);
     throw new Error(`Could not read Firecrawl settings from ${settingsPath}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return DEFAULT_FETCH_MODEL;
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error(missing);
   const section = (settings as Record<string, unknown>)[SETTINGS_KEY];
-  if (section === undefined) return DEFAULT_FETCH_MODEL;
+  if (section === undefined) throw new Error(missing);
   if (!section || typeof section !== "object" || Array.isArray(section)) {
     throw new Error(`${SETTINGS_KEY} in ${settingsPath} must be an object.`);
   }
   const configured = (section as Record<string, unknown>).fetchModel;
-  if (configured === undefined) return DEFAULT_FETCH_MODEL;
+  if (configured === undefined) throw new Error(missing);
   if (typeof configured !== "string" || !configured.includes("/") || !configured.trim()) {
     throw new Error(`${SETTINGS_KEY}.fetchModel in ${settingsPath} must be a provider/model string.`);
   }
@@ -99,13 +103,13 @@ function presentSearch(
   includeContent: boolean,
 ): string {
   const seenUrls = new Set<string>();
-  const items = result.web.filter((item) => {
+  const web = result.web.filter((item) => {
     const key = item.url.trim().replace(/\/$/, "");
     if (!key || seenUrls.has(key)) return false;
     seenUrls.add(key);
     return true;
   });
-  const sections = items.map((item, index) => {
+  const sections = web.map((item, index) => {
     const lines = [`Result ${index + 1}: ${item.title?.trim() || "Untitled"}`, `URL: ${item.url}`];
     if (item.description?.trim()) lines.push(`Snippet: ${compactSearchText(item.description, SEARCH_SNIPPET_MAX_CHARS)}`);
     if (item.category?.trim()) lines.push(`Category: ${item.category.trim()}`);
@@ -117,8 +121,37 @@ function presentSearch(
     }
     return lines.join("\n");
   });
+  sections.push(...result.news.map((item, index) => [
+    `News ${index + 1}: ${item.title?.trim() || "Untitled"}${item.date ? ` (${item.date})` : ""}`,
+    `URL: ${item.url}`,
+    ...(item.snippet?.trim() ? [`Snippet: ${compactSearchText(item.snippet, SEARCH_SNIPPET_MAX_CHARS)}`] : []),
+  ].join("\n")));
+  sections.push(...result.images.map((item, index) => [
+    `Image ${index + 1}: ${item.title?.trim() || "Untitled"}${item.imageWidth && item.imageHeight ? ` (${item.imageWidth}x${item.imageHeight})` : ""}`,
+    `Image URL: ${item.imageUrl}`,
+    ...(item.url ? [`Page: ${item.url}`] : []),
+  ].join("\n")));
+  sections.push(...result.tools.map((tool, index) => [
+    `Tool ${index + 1}: {provider: "${tool.provider}", capability: "${tool.capability}"}${tool.creditsCost === undefined ? "" : ` (${tool.creditsCost} credits${tool.perRecord ? " per record" : ""})`}`,
+    ...(tool.description?.trim() ? [compactSearchText(tool.description, SEARCH_SNIPPET_MAX_CHARS)] : []),
+    ...(tool.requiresOneOf ? [`Requires one of: ${JSON.stringify(tool.requiresOneOf)}`] : []),
+  ].join("\n")));
+  if (result.tools.length > 0) {
+    sections.push('Inspect a tool\'s options with web_fetch({ alexandria: { provider: "firecrawl", capability: "find-tools", options: { providers: [provider], capabilities: [capability], expand: ["options", "examples"] } } }), then run it with web_fetch({ alexandria: { provider, capability, options } }).');
+  }
   const body = sections.length > 0 ? sections.join("\n\n---\n\n") : `No results returned for query: ${query}`;
   return `Results for query "${query}":\n\n${body}${result.warning ? `\n\nWarning: ${compactSearchText(result.warning, 600)}` : ""}`;
+}
+
+function presentAlexandria(response: AlexandriaResponse): string {
+  return response.results.map((result) => result.kind === "ok"
+    ? `${result.provider}/${result.capability} (${result.creditsCost} credits):\n${JSON.stringify(result.data, null, 2)}`
+    : `${result.provider}/${result.capability} failed:\n${JSON.stringify(result.error, null, 2)}`).join("\n\n");
+}
+
+function failOnSourceError(result: FirecrawlScrapeResult, url: string): void {
+  if ((result.metadata.statusCode ?? 0) < 400) return;
+  throw new Error(`Page fetch failed (HTTP ${result.metadata.statusCode}): ${result.metadata.error ?? result.metadata.title ?? "source returned an error"}. URL: ${url}`);
 }
 
 function scrapeHeader(result: FirecrawlScrapeResult, url: string): string {
@@ -141,17 +174,15 @@ export function presentScrape(
   result: FirecrawlScrapeResult,
   url: string,
   formats: readonly FirecrawlScrapeFormat[],
-  focus?: { extracted?: ExtractedContent },
+  extracted?: ExtractedContent,
 ): string {
-  const focusNotice = focus
-    ? !focus.extracted
-      ? "Focused extraction unavailable; returned cleaned page content."
-      : focus.extracted.inputTruncated
-        ? "Warning: Focused extraction input was limited to 120,000 characters; the model did not see the entire page. Fetch without instruction for complete source content."
-        : "Focused extraction."
+  const focusNotice = extracted
+    ? extracted.inputTruncated
+      ? `Warning: Focused extraction by ${extracted.model} saw only the first 120,000 characters of the page. Fetch without instruction for complete source content.`
+      : `Focused extraction by ${extracted.model}.`
     : undefined;
   const lines = [focusNotice, scrapeHeader(result, url)].filter((line): line is string => line !== undefined);
-  if (focus?.extracted) return [...lines, focus.extracted.text].join("\n\n");
+  if (extracted) return [...lines, extracted.text].join("\n\n");
   const headerCount = lines.length;
   for (const format of formats) {
     const value = result[format as keyof FirecrawlScrapeResult];
@@ -197,7 +228,7 @@ export default function firecrawlWeb(pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web through Firecrawl. Returns compact titles, URLs, and snippets. includeContent requests page Markdown (extra credits). Output defaults to 8,192 characters, capped at 20,000; truncated output is saved for read.",
+      "Search through Firecrawl. Returns compact titles, URLs, and snippets. sources adds news, images, or free Alexandria data-tool discovery; includeContent adds page Markdown (extra credits). Output defaults to 8,192 characters, capped at 20,000; truncated output is saved for read.",
     promptGuidelines: ["Prefer native web tools for public-web research; use MCP only for unsupported formats or advanced controls."],
     promptSnippet: "Search the live web through Firecrawl",
     parameters: Type.Object({
@@ -206,6 +237,9 @@ export default function firecrawlWeb(pi: ExtensionAPI) {
       includeDomains: Type.Optional(Type.Array(Type.String(), { maxItems: 20, description: "Only return these domains." })),
       excludeDomains: Type.Optional(Type.Array(Type.String(), { maxItems: 20, description: "Exclude these domains." })),
       recency: Type.Optional(StringEnum(["hour", "day", "week", "month", "year"] as const)),
+      sources: Type.Optional(Type.Array(StringEnum(SEARCH_SOURCES), { minItems: 1, maxItems: 4, description: "Default [\"web\"]. \"alexandria\" alone returns structured data tools (free) to run with web_fetch." })),
+      categories: Type.Optional(Type.Array(StringEnum(SEARCH_CATEGORIES), { minItems: 1, maxItems: 5, description: "Restrict web results to these site categories." })),
+      highlights: Type.Optional(Type.Boolean({ description: "Query-relevant page passages instead of short snippets; slower. Default false." })),
       includeContent: Type.Optional(Type.Boolean({ description: "Request page Markdown with search results; costs extra credits. Default false. Content previews preserve code formatting." })),
       maxAge: Type.Optional(Type.Integer({ minimum: 0, description: "Maximum page cache age in milliseconds; 0 forces fresh scraping. Requires includeContent=true." })),
       maxChars: Type.Optional(Type.Integer({ minimum: 1000, maximum: 20000, description: "Maximum returned characters; default 8192." })),
@@ -221,7 +255,10 @@ export default function firecrawlWeb(pi: ExtensionAPI) {
       const result = await client().search({
         query,
         limit: params.limit ?? 5,
-        sources: ["web"],
+        sources: params.sources ?? ["web"],
+        categories: params.categories,
+        highlights: params.highlights ?? false,
+        toolDetail: params.sources?.includes("alexandria") ? "summary" : undefined,
         includeDomains: params.includeDomains,
         excludeDomains: params.excludeDomains,
         tbs: params.recency ? RECENCY_TO_TBS[params.recency] : undefined,
@@ -234,8 +271,11 @@ export default function firecrawlWeb(pi: ExtensionAPI) {
           provider: "firecrawl",
           query,
           includeContent: params.includeContent ?? false,
-          resultCount: result.web.length,
+          resultCount: result.web.length + result.news.length + result.images.length + result.tools.length,
           results: result.web.map(({ markdown: _markdown, ...item }) => item),
+          news: result.news,
+          images: result.images,
+          tools: result.tools,
           fullOutputPath: output.fullOutputPath,
           warning: result.warning,
           creditsUsed: result.creditsUsed,
@@ -259,57 +299,81 @@ export default function firecrawlWeb(pi: ExtensionAPI) {
     name: "web_fetch",
     label: "Web Fetch",
     description:
-      "Fetch a URL through Firecrawl with HTTP/cache metadata and cleaned content. maxAge=0 forces a fresh fetch. instruction extracts relevant content using firecrawl-web.fetchModel, falling back to cleaned Markdown. Output is capped at 40,000 characters; complete truncated output is saved for read with offset/limit.",
+      "Fetch a URL through Firecrawl with HTTP/cache metadata and cleaned content, or run an Alexandria data tool. instruction has the firecrawl-web.fetchModel model answer from the cleaned page; with schema it returns JSON. maxAge=0 forces a fresh fetch. Output is capped at 40,000 characters; complete truncated output is saved for read with offset/limit.",
     promptSnippet: "Fetch or focus-extract a web page through Firecrawl",
     parameters: Type.Object({
-      url: Type.String({ description: "HTTP(S) page URL." }),
+      url: Type.Optional(Type.String({ description: "HTTP(S) page URL. Required unless alexandria is given." })),
+      alexandria: Type.Optional(Type.Object({
+        provider: Type.String(),
+        capability: Type.String(),
+        options: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+      }, { description: "Run a catalogued data tool instead of fetching a URL; charged at the tool's listed price. Discover with web_search sources [\"alexandria\"]. provider \"firecrawl\", capability \"find-tools\" is free and returns contracts." })),
       formats: Type.Optional(Type.Array(StringEnum(SCRAPE_FORMATS), { minItems: 1, maxItems: 4, description: "Formats; default markdown." })),
       onlyMainContent: Type.Optional(Type.Boolean({ description: "Exclude navigation and boilerplate; default true." })),
-      instruction: Type.Optional(Type.String({ description: "Optional focused extraction instruction. This invokes a cheap authenticated text model." })),
+      instruction: Type.Optional(Type.String({ description: "Question or extraction instruction that the firecrawl-web.fetchModel model answers from the cleaned page." })),
+      schema: Type.Optional(Type.Record(Type.String(), Type.Unknown(), { description: "JSON Schema for structured extraction; instruction becomes its prompt." })),
       maxAge: Type.Optional(Type.Integer({ minimum: 0, description: "Maximum Firecrawl cache age in milliseconds; 0 forces a fresh fetch. Omit to use Firecrawl's default cache policy." })),
       maxChars: Type.Optional(Type.Integer({ minimum: 1000, maximum: 40000, description: "Maximum returned characters; default 20,000 raw or 12,000 focused." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (params.alexandria) {
+        if (params.url) throw new Error("Pass either url or alexandria, not both.");
+        const call = params.alexandria;
+        onUpdate?.({ content: [{ type: "text", text: `Running: ${call.provider}/${call.capability}` }], details: {} });
+        const response = await client().alexandria(call, signal);
+        const output = await boundedOutput(presentAlexandria(response), params.maxChars ?? DEFAULT_FETCH_MAX_CHARS, signal);
+        return {
+          content: [{ type: "text", text: output.text }],
+          details: { provider: "firecrawl", alexandria: call, creditsCost: response.creditsCost, fullOutputPath: output.fullOutputPath },
+        };
+      }
+      const url = params.url?.trim();
+      if (!url) throw new Error("web_fetch needs url or alexandria.");
       const formats = (params.formats ?? ["markdown"]) as FirecrawlScrapeFormat[];
       const instruction = params.instruction?.trim();
+      if (params.schema && !instruction) throw new Error("schema needs an instruction describing what to extract.");
       const outputFormats: FirecrawlScrapeFormat[] = instruction && !formats.includes("markdown") ? ["markdown", ...formats] : formats;
       const requestFormats = [...new Set([
         ...formats, ...outputFormats,
         ...(outputFormats.includes("markdown") ? ["html"] : []),
       ])] as FirecrawlScrapeFormat[];
       const maxOutput = params.maxChars ?? (instruction ? 12000 : DEFAULT_FETCH_MAX_CHARS);
-      onUpdate?.({ content: [{ type: "text", text: `Fetching: ${params.url}` }], details: {} });
+      const model = instruction ? fetchModel() : undefined;
+      onUpdate?.({ content: [{ type: "text", text: `Fetching: ${url}` }], details: {} });
       const result = await client().scrape({
-        url: params.url,
+        url,
         formats: requestFormats,
         onlyMainContent: params.onlyMainContent ?? true,
         maxAge: params.maxAge,
       }, signal);
-      if ((result.metadata.statusCode ?? 0) >= 400) {
-        throw new Error(`Page fetch failed (HTTP ${result.metadata.statusCode}): ${result.metadata.error ?? result.metadata.title ?? "source returned an error"}. URL: ${params.url}`);
-      }
+      failOnSourceError(result, url);
       const defuddledMarkdown = outputFormats.includes("markdown") && params.onlyMainContent !== false && result.html
-        ? await cleanFirecrawlHtml(result.html, params.url) : undefined;
+        ? await cleanFirecrawlHtml(result.html, url) : undefined;
       signal?.throwIfAborted();
       const cleanedResult = defuddledMarkdown ? { ...result, markdown: defuddledMarkdown } : result;
       const cleaner = defuddledMarkdown ? "defuddle" : "firecrawl";
-      const extracted = instruction && cleanedResult.markdown ? await extractFirecrawlContent({
-        registry: ctx.modelRegistry,
-        url: params.url,
-        markdown: cleanedResult.markdown,
-        instruction,
-        model: fetchModel(),
-        maxOutput,
-        signal,
-      }) : undefined;
-      const body = presentScrape(cleanedResult, params.url, outputFormats, instruction ? { extracted } : undefined);
+      let extracted: ExtractedContent | undefined;
+      if (instruction && model) {
+        if (!cleanedResult.markdown) throw new Error(`Firecrawl returned no page content for ${url}, so ${model} cannot answer the instruction.`);
+        extracted = await extractFirecrawlContent({
+          registry: ctx.modelRegistry,
+          url,
+          markdown: cleanedResult.markdown,
+          instruction,
+          schema: params.schema,
+          model,
+          maxOutput,
+          signal,
+        });
+      }
+      const body = presentScrape(cleanedResult, url, outputFormats, extracted);
       const output = await boundedOutput(body, maxOutput, signal);
       return {
         content: [{ type: "text", text: output.text }],
         details: {
           provider: "firecrawl",
           cleaner,
-          url: params.url,
+          url,
           formats: outputFormats,
           metadata: result.metadata,
           warning: result.warning,
@@ -323,7 +387,8 @@ export default function firecrawlWeb(pi: ExtensionAPI) {
     },
     renderCall(args, theme) {
       const suffix = args.instruction ? theme.fg("dim", " focused") : "";
-      return new Text(`${theme.fg("toolTitle", theme.bold("WebFetch "))}${theme.fg("accent", args.url)}${suffix}`, 0, 0);
+      const target = args.alexandria ? `${args.alexandria.provider}/${args.alexandria.capability}` : args.url ?? "";
+      return new Text(`${theme.fg("toolTitle", theme.bold("WebFetch "))}${theme.fg("accent", target)}${suffix}`, 0, 0);
     },
     renderResult(result, { isPartial, expanded }, theme, ctx) {
       if (isPartial) return new Text(theme.fg("warning", "Fetching..."), 0, 0);

@@ -9,8 +9,10 @@ export type FirecrawlScrapeFormat =
   | "images"
   | "screenshot"
   | "branding"
-  | "audio"
-  | "highlights";
+  | "audio";
+
+export type SearchSource = "web" | "news" | "images" | "alexandria";
+export type SearchCategory = "github" | "research" | "pdf" | "developer" | "gov";
 
 export interface FirecrawlWebResult {
   url: string;
@@ -20,8 +22,41 @@ export interface FirecrawlWebResult {
   category?: string;
 }
 
+export interface FirecrawlNewsResult {
+  url: string;
+  title?: string;
+  snippet?: string;
+  date?: string;
+}
+
+export interface FirecrawlImageResult {
+  url?: string;
+  imageUrl: string;
+  title?: string;
+  imageWidth?: number;
+  imageHeight?: number;
+}
+
+export interface AlexandriaCall {
+  provider: string;
+  capability: string;
+  options?: Record<string, unknown>;
+}
+
+export interface FirecrawlToolContract {
+  provider: string;
+  capability: string;
+  description?: string;
+  creditsCost?: number;
+  perRecord?: boolean;
+  requiresOneOf?: unknown;
+}
+
 export interface FirecrawlSearchResult {
   web: FirecrawlWebResult[];
+  news: FirecrawlNewsResult[];
+  images: FirecrawlImageResult[];
+  tools: FirecrawlToolContract[];
   warning?: string;
   id?: string;
   creditsUsed?: number;
@@ -50,12 +85,20 @@ export interface FirecrawlScrapeResult {
   rawHtml?: string;
   screenshot?: string;
   audio?: string;
-  highlights?: string[];
   links?: string[];
   images?: string[];
   branding?: Record<string, unknown>;
   metadata: FirecrawlScrapeMetadata;
   warning?: string;
+}
+
+export type AlexandriaResult =
+  | { kind: "ok"; provider: string; capability: string; creditsCost: number; data: unknown }
+  | { kind: "error"; provider: string; capability: string; error: unknown };
+
+export interface AlexandriaResponse {
+  results: AlexandriaResult[];
+  creditsCost?: number;
 }
 
 export interface FirecrawlMapLink {
@@ -71,10 +114,15 @@ export interface FirecrawlMapResult {
 export interface SearchRequest {
   query: string;
   limit?: number;
-  sources: ["web"];
+  sources: SearchSource[];
+  categories?: SearchCategory[];
   includeDomains?: string[];
   excludeDomains?: string[];
   tbs?: string;
+  country?: string;
+  location?: string;
+  highlights: boolean;
+  toolDetail?: "compact" | "summary" | "full";
   scrapeOptions?: { formats: ["markdown"]; onlyMainContent: boolean; maxAge?: number };
 }
 
@@ -109,6 +157,10 @@ export class FirecrawlTransportError extends Error {
     this.name = "FirecrawlTransportError";
   }
 }
+
+// Free plans allow ~12 requests/minute; codemode fan-out hits that quickly.
+const MAX_RATE_LIMIT_RETRIES = 3;
+const MAX_RATE_LIMIT_WAIT_SECONDS = 30;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -145,22 +197,55 @@ function requireSuccess(payload: unknown, label: string): Record<string, unknown
   return record;
 }
 
+function records(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
 function parseWebResults(value: unknown): FirecrawlWebResult[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    if (!isRecord(item) || typeof item.url !== "string") return [];
+  return records(value).flatMap((item) => typeof item.url !== "string" ? [] : [{
+    url: item.url,
+    title: stringValue(item.title),
+    description: stringValue(item.description),
+    markdown: stringValue(item.markdown),
+    category: stringValue(item.category),
+  }]);
+}
+
+function parseNewsResults(value: unknown): FirecrawlNewsResult[] {
+  return records(value).flatMap((item) => typeof item.url !== "string" ? [] : [{
+    url: item.url,
+    title: stringValue(item.title),
+    snippet: stringValue(item.snippet),
+    date: stringValue(item.date),
+  }]);
+}
+
+function parseImageResults(value: unknown): FirecrawlImageResult[] {
+  return records(value).flatMap((item) => typeof item.imageUrl !== "string" ? [] : [{
+    imageUrl: item.imageUrl,
+    url: stringValue(item.url),
+    title: stringValue(item.title),
+    imageWidth: numberValue(item.imageWidth),
+    imageHeight: numberValue(item.imageHeight),
+  }]);
+}
+
+function parseToolContracts(value: unknown): FirecrawlToolContract[] {
+  return records(value).flatMap((item) => {
+    if (typeof item.provider !== "string" || typeof item.capability !== "string") return [];
     return [{
-      url: item.url,
-      title: stringValue(item.title),
+      provider: item.provider,
+      capability: item.capability,
       description: stringValue(item.description),
-      markdown: stringValue(item.markdown),
-      category: stringValue(item.category),
+      creditsCost: numberValue(item.creditsCost),
+      perRecord: typeof item.perRecord === "boolean" ? item.perRecord : undefined,
+      requiresOneOf: item.requiresOneOf,
     }];
   });
 }
 
-function responseWarning(...records: Record<string, unknown>[]): string | undefined {
-  const warnings = records.flatMap((record) => [stringValue(record.warning), ...(stringArray(record.warnings) ?? [])]);
+function responseWarning(...items: Record<string, unknown>[]): string | undefined {
+  const warnings = items.flatMap((item) => [stringValue(item.warning), ...(stringArray(item.warnings) ?? [])]);
   return [...new Set(warnings.filter((value): value is string => Boolean(value)))].join("; ") || undefined;
 }
 
@@ -169,6 +254,9 @@ function parseSearchResponse(payload: unknown): FirecrawlSearchResult {
   const data = requireRecord(response.data, "search data");
   return {
     web: parseWebResults(data.web),
+    news: parseNewsResults(data.news),
+    images: parseImageResults(data.images),
+    tools: parseToolContracts(data.tools),
     warning: responseWarning(response, data),
     id: stringValue(response.id),
     creditsUsed: numberValue(response.creditsUsed),
@@ -185,7 +273,6 @@ function parseScrapeResponse(payload: unknown): FirecrawlScrapeResult {
     rawHtml: stringValue(data.rawHtml),
     screenshot: stringValue(data.screenshot),
     audio: stringValue(data.audio),
-    highlights: stringArray(data.highlights),
     links: stringArray(data.links),
     images: stringArray(data.images),
     branding: isRecord(data.branding) ? data.branding : undefined,
@@ -194,20 +281,52 @@ function parseScrapeResponse(payload: unknown): FirecrawlScrapeResult {
   };
 }
 
+function parseAlexandriaResponse(payload: unknown): AlexandriaResponse {
+  const response = requireSuccess(payload, "alexandria");
+  const data = requireRecord(response.data, "alexandria data");
+  return {
+    creditsCost: numberValue(data.creditsCost),
+    results: records(data.alexandria).map((item) => {
+      const provider = stringValue(item.provider) ?? "unknown";
+      const capability = stringValue(item.capability) ?? "unknown";
+      return item.error !== undefined
+        ? { kind: "error", provider, capability, error: item.error }
+        : { kind: "ok", provider, capability, creditsCost: numberValue(item.creditsCost) ?? 0, data: item.data };
+    }),
+  };
+}
+
 function parseMapResponse(payload: unknown): FirecrawlMapResult {
   const response = requireSuccess(payload, "map");
-  const links: FirecrawlMapLink[] = [];
-  if (Array.isArray(response.links)) {
-    for (const item of response.links) {
-      if (!isRecord(item) || typeof item.url !== "string") continue;
-      links.push({
-        url: item.url,
-        title: stringValue(item.title),
-        description: stringValue(item.description),
-      });
-    }
-  }
-  return { links };
+  return {
+    links: records(response.links).flatMap((item) => typeof item.url !== "string" ? [] : [{
+      url: item.url,
+      title: stringValue(item.title),
+      description: stringValue(item.description),
+    }]),
+  };
+}
+
+function retryAfterSeconds(payload: unknown, response: Response): number | undefined {
+  const fromBody = isRecord(payload) ? numberValue(payload.retry_after_seconds) : undefined;
+  if (fromBody !== undefined) return fromBody;
+  const header = Number(response.headers.get("retry-after"));
+  return Number.isFinite(header) && header >= 0 ? header : undefined;
+}
+
+function sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export class FirecrawlClient {
@@ -228,37 +347,49 @@ export class FirecrawlClient {
     return parseScrapeResponse(await this.request("scrape", options, signal));
   }
 
+  async alexandria(call: AlexandriaCall, signal?: AbortSignal): Promise<AlexandriaResponse> {
+    // The request id makes a retried execution replay instead of billing twice.
+    const headers = { "x-request-id": crypto.randomUUID() };
+    return parseAlexandriaResponse(await this.request("scrape", { alexandria: call }, signal, headers));
+  }
+
   async map(options: MapRequest, signal?: AbortSignal): Promise<FirecrawlMapResult> {
     return parseMapResponse(await this.request("map", options, signal));
   }
 
-  private async request(endpoint: string, body: object, signal?: AbortSignal): Promise<unknown> {
-    signal?.throwIfAborted();
-    let response: Response;
-    try {
-      response = await fetch(`${this.baseUrl}/${endpoint}`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(body),
-        signal,
-      });
-    } catch (error) {
-      if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
-      throw new FirecrawlTransportError();
-    }
+  private async request(endpoint: string, body: object, signal?: AbortSignal, headers?: Record<string, string>): Promise<unknown> {
+    for (let attempt = 0; ; attempt++) {
+      signal?.throwIfAborted();
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseUrl}/${endpoint}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json",
+            ...headers,
+          },
+          body: JSON.stringify(body),
+          signal,
+        });
+      } catch (error) {
+        if (signal?.aborted || (error instanceof DOMException && error.name === "AbortError")) throw error;
+        throw new FirecrawlTransportError();
+      }
 
-    if (!response.ok) {
+      if (response.ok) return this.readJson(response, signal);
       const payload = await this.readJson(response, signal);
+      const wait = response.status === 429 ? retryAfterSeconds(payload, response) ?? 5 : undefined;
+      if (wait !== undefined && attempt < MAX_RATE_LIMIT_RETRIES && wait <= MAX_RATE_LIMIT_WAIT_SECONDS) {
+        await sleep(wait * 1000 + 250, signal);
+        continue;
+      }
       throw new FirecrawlApiError(
         `Firecrawl HTTP ${response.status}: ${isRecord(payload) ? stringValue(payload.error) ?? "request failed" : "request failed"}.`,
         response.status,
         isRecord(payload) ? stringValue(payload.code) : undefined,
       );
     }
-    return this.readJson(response, signal);
   }
 
   private async readJson(response: Response, signal?: AbortSignal): Promise<unknown> {
